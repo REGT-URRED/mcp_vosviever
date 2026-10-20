@@ -67,6 +67,20 @@ STATE: dict[str, Any] = {
     "gui_pid": None,  # javaw.exe that actually owns the Swing windows
 }
 
+
+def _reset_state() -> None:
+    """Deja el estado global como si nunca se hubiera abierto nada."""
+    STATE.update(
+        {
+            "proc": None,
+            "pid": None,
+            "started": None,
+            "args": None,
+            "pids": [],
+            "gui_pid": None,
+        }
+    )
+
 # ------------------------------------------------------------------ argv specs
 
 _INPUT_FLAGS = [
@@ -631,6 +645,9 @@ def _vosviewer_pids() -> list[int]:
         if pid not in seeds and exe.lower() == "vosviewer.exe":
             seeds.append(pid)
     ordered = list(seeds)
+    # La lista se recuerda para que una corrida posterior encuentre un launcher
+    # huerfano. Es una cache explicita, no un efecto colateral.
+    STATE["pids"] = ordered
     for seed in seeds:
         for child in _process_children(seed):
             if child not in ordered and _pid_alive(child) and _is_gui_child(child):
@@ -1267,13 +1284,14 @@ def _validate_network_file(path: str) -> list[str]:
 def _run_batch(argv: list[str], timeout_s: float) -> dict[str, Any]:
     """Batch mode: VOSviewer exits by itself; we only guard it against modal dialogs."""
     started = time.monotonic()
+    preparacion: list[str] = []
     for i, token in enumerate(argv):
         if token.startswith("-") and "save" in token and i + 1 < len(argv):
             target = argv[i + 1]
             if target and not target.startswith("-"):
                 # La carpeta tiene que existir y quedar con integridad baja:
                 # si no, VOSviewer abre un dialogo "Acceso denegado" y cuelga.
-                _prepare_out_dir(target)
+                _prepare_out_dir(target, preparacion)
                 if os.path.isfile(target):
                     try:
                         os.unlink(target)
@@ -1373,6 +1391,7 @@ def _run_batch(argv: list[str], timeout_s: float) -> dict[str, Any]:
         "killed_children": killed,
         "dialogs_answered": answered,
         "progress_windows": sorted(progress),
+        "preparation_problems": preparacion,
     }
 
 
@@ -1392,11 +1411,16 @@ def _collect_outputs(outputs: dict[str, Any]) -> dict[str, Any]:
 
 
 def _stats_from(outputs: dict[str, Any]) -> dict[str, Any]:
-    ready = {
-        k: v["path"]
-        for k, v in outputs.items()
-        if not v.get("missing") and not v.get("empty")
-    }
+    ready = {}
+    for k, v in outputs.items():
+        if v.get("missing") or v.get("empty"):
+            continue
+        try:
+            if os.path.getsize(v["path"]) == 0:
+                continue
+        except OSError:
+            continue
+        ready[k] = v["path"]
     if "save_json" in ready:
         doc = parse_json_map(ready["save_json"])
     elif "save_map" in ready:
@@ -1529,8 +1553,11 @@ def vos_analyze(
         result = _run_batch(argv, timeout_s)
         written = _collect_outputs(salidas)
         faltan = sorted(k for k, e in written.items() if e.get("missing"))
-        if not result.get("ok"):
+        if not result.get("ok") or faltan:
+            # Salir con codigo 0 sin escribir lo pedido tambien es un fallo:
+            # el que recibe el archivo que no existe tiene que saberlo.
             respuesta = dict(result)
+            respuesta["ok"] = False
             respuesta["outputs"] = written
             respuesta["missing_outputs"] = faltan
             stderr = (result.get("stderr") or "").strip()
@@ -1540,6 +1567,11 @@ def vos_analyze(
                     "VOSviewer salio con codigo %s y no escribio %s. Primera linea "
                     "del stderr: %s"
                     % (result.get("exit_code"), ", ".join(faltan) or "nada", primera)
+                )
+            elif faltan:
+                respuesta["hint"] = (
+                    "VOSviewer salio con codigo 0 pero no escribio: %s"
+                    % ", ".join(faltan)
                 )
             return respuesta
         recuperaciones: list[dict[str, Any]] = []
@@ -1572,6 +1604,7 @@ def vos_analyze(
         if recuperaciones:
             respuesta["screenshot_recovery"] = recuperaciones
         avisos: list[str] = []
+        avisos.extend(result.get("preparation_problems") or [])
         if vacios:
             avisos.append("Quedaron archivos de 0 bytes: %s" % ", ".join(vacios))
         sin_captura = [r["flag"] for r in recuperaciones if not r.get("ok")]
@@ -1900,16 +1933,9 @@ def vos_open(
                         "exit immediately, which would orphan the javaw.exe GUI; "
                         "use vos_analyze for batch mode"
                     )
-        inputs: dict[str, Any] = {}
-        if source_path:
-            inputs[source] = _absolute(source_path)
-        for flag, path in (
-            ("network", network_path),
-            ("thesaurus", thesaurus_path),
-            ("scores", scores_path),
-        ):
-            if path:
-                inputs[flag] = _absolute(path)
+        inputs = _build_inputs(
+            source, source_path, network_path, thesaurus_path, scores_path
+        )
         argv = [VOSVIEWER_EXE] + build_argv(
             {"input": inputs, **{k: (v or {}) for k, v in groups.items()}},
             require_saves=False,
@@ -2024,16 +2050,7 @@ def vos_close() -> dict[str, Any]:
         for pid in reversed(pids):  # children first, the launcher last
             if _pid_alive(pid):
                 _kill_tree(pid)
-        STATE.update(
-            {
-                "proc": None,
-                "pid": None,
-                "started": None,
-                "args": None,
-                "pids": [],
-                "gui_pid": None,
-            }
-        )
+        _reset_state()
         remaining = [p for p in pids if _pid_alive(p)]
         return {
             "ok": True,
