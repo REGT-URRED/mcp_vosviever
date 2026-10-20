@@ -1,4 +1,4 @@
-﻿"""MCP server that drives the local VOSviewer.exe desktop application.
+"""MCP server that drives the local VOSviewer.exe desktop application.
 
 VOSviewer has two disjoint execution paths, and that is the whole design here:
 
@@ -40,10 +40,14 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import time
 from ctypes import wintypes
 from typing import Any
+
+from PIL import Image
 
 from mcp.server import MCPServer
 
@@ -673,10 +677,12 @@ _DIALOG_DIR = os.path.join(DEFAULT_OUT_DIR, "dialogs")
 # A modal that asks something routine is answered by policy; anything unrecognised
 # is captured and reported instead of guessed, because guessing can destroy output.
 _DIALOG_RULES = (
+    # "error" va primero: un dialogo que dice "Error ... replace" no se
+    # autoconfirma con Yes.
+    ("error", "stop"),
     ("replace", "yes"),
     ("overwrite", "yes"),
     ("already exists", "yes"),
-    ("error", "stop"),
     ("about", "cancel"),
 )
 _DIALOG_DEFAULT = "stop"
@@ -797,6 +803,15 @@ def _live_vos_pids() -> list[int]:
     return out
 
 
+def _vosviewer_only_pids() -> list[int]:
+    """Pids que son VOSviewer o su hijo javaw.exe, sin mezclar otros Java.
+
+    _live_vos_pids acepta cualquier javaw.exe de la maquina: con eso, un
+    vos_dialog podia clicar el boton de otra aplicacion Java.
+    """
+    return _vosviewer_pids()
+
+
 def _kill_tree(pid: int) -> None:
     subprocess.run(
         ["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=30
@@ -819,7 +834,9 @@ def _main_window(
         if any(w["hwnd"] == fg for w in visible):
             return fg, _window_info(fg)
     if target == "modal":  # a Java dialog is a topmost window owned by the same pid
-        topmost = [w for w in visible if user32.GetWindowLongW(w["hwnd"], -20)]
+        topmost = [
+            w for w in visible if user32.GetWindowLongW(w["hwnd"], -20) & WS_EX_TOPMOST
+        ]
         if topmost:
             return int(topmost[0]["hwnd"]), topmost[0]
     if not visible:
@@ -923,24 +940,357 @@ def _absolute(path: str) -> str:
 # ------------------------------------------------------------------- run core
 
 
+def _java_home() -> str | None:
+    """Runtime de Java que se le va a pasar a VOSviewer.
+
+    Se busca en VOSVIEWER_JAVA_HOME y despues en JAVA_HOME. VOSviewer 1.6.x
+    necesita Java 8: con Java 9 o superior el modo batch revienta con una
+    excepcion de Java y no escribe ninguna salida.
+    """
+    for nombre in ("VOSVIEWER_JAVA_HOME", "JAVA_HOME"):
+        valor = os.environ.get(nombre)
+        if valor and os.path.isdir(valor):
+            return valor
+    return None
+
+
+def _java_version(java_home: str | None = None) -> tuple[int, int] | None:
+    """Version de Java del runtime indicado, o None si no se puede determinar."""
+    casa = java_home if java_home is not None else _java_home()
+    java = os.path.join(casa, "bin", "java.exe") if casa else shutil.which("java")
+    if not java or not os.path.isfile(java):
+        return None
+    try:
+        salida = subprocess.run(
+            [java, "-version"], capture_output=True, text=True, timeout=25
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    texto = (salida.stderr or "") + (salida.stdout or "")
+    coincide = re.search(r'version "(\d+)\.(\d+)', texto)
+    if not coincide:
+        return None
+    return int(coincide.group(1)), int(coincide.group(2))
+
+
+def _java_problem() -> str:
+    """Descripcion del problema de Java, o cadena vacia si el runtime sirve."""
+    version = _java_version()
+    if version is None:
+        return ""
+    if version[0] >= 9:
+        return (
+            "VOSviewer 1.6.x necesita Java 8 y el runtime disponible es Java %d.%d. "
+            "El modo batch falla con una excepcion de Java y no escribe ninguna "
+            "salida. Indica un JRE 8 en VOSVIEWER_JAVA_HOME o en JAVA_HOME."
+            % version
+        )
+    return ""
+
+
+def _vosviewer_env() -> dict[str, str]:
+    """Entorno para los procesos VOSviewer, con el runtime de Java resuelto."""
+    env = dict(os.environ)
+    casa = _java_home()
+    if casa:
+        env["JAVA_HOME"] = casa
+        env["PATH"] = os.path.join(casa, "bin") + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def _low_integrity_label(dir_path: str) -> bool:
+    """Baja la etiqueta de integridad de una carpeta a Low.
+
+    El proceso javaw.exe de VOSviewer corre con Low Mandatory Level. Un proceso
+    de integridad baja no puede escribir en una carpeta de integridad media:
+    Windows lo bloquea y Java lo reporta como "Acceso denegado" dentro de un
+    dialogo modal que el usuario tiene que cerrar a mano. Las carpetas que crea
+    el usuario con su cuenta normal quedan en Medium, asi que hay que replicar
+    la etiqueta Low antes de cada corrida.
+    """
+    if os.name != "nt" or not dir_path or not os.path.isdir(dir_path):
+        return False
+    try:
+        proc = subprocess.run(
+            ["icacls", dir_path, "/setintegritylevel", "(OI)(CI)L"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def _prepare_out_dir(path: str, problemas: list[str] | None = None) -> str:
+    """Deja la carpeta de salida lista para que VOSviewer pueda escribir en ella.
+
+    Crea la carpeta si falta y le baja la etiqueta de integridad. Si la etiqueta
+    no se puede aplicar, VOSviewer va a mostrar "Acceso denegado", asi que el
+    motivo se anota en `problemas` en vez de perderse.
+    """
+    full = _absolute(path)
+    parent = os.path.dirname(full)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+        if not _low_integrity_label(parent):
+            if problemas is not None:
+                problemas.append(
+                    "no se pudo bajar la etiqueta de integridad de %s: VOSviewer "
+                    "corre con integridad baja y no va a poder escribir ahi "
+                    "(va a mostrar 'Acceso denegado')" % parent
+                )
+    return full
+
+
+def _build_inputs(
+    source: str,
+    source_path: str | None,
+    network_path: str | None = None,
+    thesaurus_path: str | None = None,
+    scores_path: str | None = None,
+) -> dict[str, str]:
+    """Entradas de VOSviewer, sin que una pise a otra.
+
+    Con source='network' y network_path a la vez el source_path se perdia en
+    silencio; ahora es un error explicito.
+    """
+    entradas: dict[str, str] = {}
+    if source_path:
+        entradas[source] = _absolute(source_path)
+    for flag, path in (
+        ("network", network_path),
+        ("thesaurus", thesaurus_path),
+        ("scores", scores_path),
+    ):
+        if not path:
+            continue
+        if flag in entradas:
+            raise ValueError(
+                "el archivo de %s esta definido dos veces: como source y como %s" % (flag, flag)
+            )
+        entradas[flag] = _absolute(path)
+    return entradas
+
+
+def _validate_inputs(entradas: dict[str, str]) -> list[str]:
+    """Todo lo que haria fallar a VOSviewer con un dialogo modal, detectado antes."""
+    problemas: list[str] = []
+    for flag, path in entradas.items():
+        if not os.path.isfile(path):
+            problemas.append("el archivo de %s no existe: %s" % (flag, path))
+    if problemas:
+        return problemas
+    if "map" in entradas:
+        problemas += _validate_map_file(entradas["map"])
+    if "network" in entradas:
+        problemas += _validate_network_file(entradas["network"])
+    return problemas
+
+
+def _recover_screenshot(
+    mapa: str | None,
+    red: str | None,
+    layout: dict[str, Any] | None,
+    visualization: dict[str, Any] | None,
+    destino: str,
+    max_wait_s: float = 45.0,
+) -> dict[str, Any]:
+    """Saca una captura real de la ventana de VOSviewer.
+
+    El flag -save_screenshot_png no sirve en modo batch: en esta maquina aborta
+    la corrida entera y deja el archivo en 0 bytes. La via que funciona es
+    abrir la aplicacion en modo interactivo con el mapa ya calculado, esperar
+    a que el render se estabilice y capturar la ventana.
+
+    Se mide la estabilidad comparando dos capturas consecutivas: cuando el PNG
+    deja de cambiar, el render termino. Ademas se exige que la imagen tenga
+    contenido, porque una ventana sin pintar tambien da dos capturas iguales.
+    """
+    if not mapa or not os.path.isfile(mapa):
+        return {
+            "ok": False,
+            "error": "no hay ningun mapa para capturar: la corrida batch no guardo "
+            "save_map y no se paso source_path",
+        }
+    destino = _absolute(destino)
+    _prepare_out_dir(destino)
+    temporal = os.path.join(os.path.dirname(destino), ".captura_en_curso.png")
+    inicio = time.monotonic()
+    intentos = 0
+    previo: str | None = None
+    try:
+        vos_close()
+        abierto = vos_open(
+            source="map",
+            source_path=mapa,
+            network_path=red,
+            layout=layout or {},
+            visualization=visualization or {},
+        )
+        if not abierto.get("ok"):
+            return {
+                "ok": False,
+                "error": "no se pudo abrir VOSviewer para la captura: %s"
+                % abierto.get("error", "sin detalle"),
+            }
+        while time.monotonic() - inicio < max_wait_s:
+            intentos += 1
+            captura = vos_capture(
+                scope="window", target="active", out_path=temporal
+            )
+            if not captura.get("ok"):
+                time.sleep(1.0)
+                continue
+            if not _imagen_con_contenido(temporal):
+                previo = None
+                time.sleep(1.2)
+                continue
+            actual = _sha256_file(temporal)
+            if actual == previo:
+                with open(temporal, "rb") as fh:
+                    datos = fh.read()
+                with open(destino, "wb") as fh:
+                    fh.write(datos)
+                return {
+                    "ok": True,
+                    "path": destino,
+                    "bytes": len(datos),
+                    "attempts": intentos,
+                    "method": captura.get("method"),
+                }
+            previo = actual
+            time.sleep(1.2)
+        if os.path.isfile(temporal) and _imagen_con_contenido(temporal):
+            with open(temporal, "rb") as fh:
+                datos = fh.read()
+            with open(destino, "wb") as fh:
+                fh.write(datos)
+            return {
+                "ok": True,
+                "path": destino,
+                "bytes": len(datos),
+                "attempts": intentos,
+                "method": "ultima captura sin estabilizar",
+            }
+        return {
+            "ok": False,
+            "error": "la ventana no llego a pintarse en %.0fs" % max_wait_s,
+            "attempts": intentos,
+        }
+    finally:
+        vos_close()
+        if os.path.isfile(temporal):
+            try:
+                os.unlink(temporal)
+            except OSError:
+                pass
+
+
+def _imagen_con_contenido(path: str) -> bool:
+    """True si el PNG no es una imagen lisa.
+
+    Una ventana sin pintar produce dos capturas identicas: sin esta comprobacion
+    la recuperacion devolveria un PNG blanco como si fuera el mapa.
+    """
+    try:
+        with Image.open(path) as imagen:
+            extremos = imagen.convert("L").getextrema()
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("no se pudo leer la captura %s: %s" % (path, exc)) from exc
+    return bool(extremos) and extremos[0] != extremos[1]
+
+
+def _validate_map_file(path: str) -> list[str]:
+    """Problemas del mapa que harian fallar a VOSviewer con un dialogo modal.
+
+    El caso caro es el mapa con las mismas coordenadas para todos los items:
+    VOSviewer responde "All items have the same coordinates" y se queda esperando
+    a que alguien cierre la ventana.
+    """
+    problemas: list[str] = []
+    if not os.path.isfile(path):
+        return ["el archivo de mapa no existe: %s" % path]
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lineas = fh.read().splitlines()
+    except OSError as exc:
+        return ["no se pudo leer el archivo de mapa %s: %s" % (path, exc)]
+    if len(lineas) < 2:
+        return ["el archivo de mapa %s no tiene datos" % path]
+    cabecera = lineas[0].split("\t")
+    if "x" not in cabecera or "y" not in cabecera:
+        return [
+            "el mapa %s no tiene las columnas x e y; VOSviewer espera "
+            "id, label, description, x, y, cluster, weight<...>" % path
+        ]
+    ix, iy = cabecera.index("x"), cabecera.index("y")
+    xs: set[str] = set()
+    ys: set[str] = set()
+    for linea in lineas[1:]:
+        campos = linea.split("\t")
+        if len(campos) <= max(ix, iy):
+            continue
+        xs.add(campos[ix].strip())
+        ys.add(campos[iy].strip())
+    if len(xs) == 1 and len(ys) == 1:
+        problemas.append(
+            "el mapa %s tiene las mismas coordenadas x e y para todos los items; "
+            "VOSviewer lo rechaza con 'All items have the same coordinates'. "
+            "Asigna coordenadas distintas por item." % path
+        )
+    return problemas
+
+
+def _validate_network_file(path: str) -> list[str]:
+    """Problemas de la red. VOSviewer solo lee redes tab-delimitadas."""
+    problemas: list[str] = []
+    if not os.path.isfile(path):
+        return ["el archivo de red no existe: %s" % path]
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lineas = [l for l in fh.read().splitlines() if l.strip()]
+    except OSError as exc:
+        return ["no se pudo leer el archivo de red %s: %s" % (path, exc)]
+    if not lineas:
+        return ["el archivo de red %s esta vacio" % path]
+    for numero, linea in enumerate(lineas[:5], 1):
+        if "\t" not in linea:
+            problemas.append(
+                "la red %s no esta separada por tabulador (linea %d: %r). VOSviewer "
+                "espera id1<tab>id2<tab>peso, sin cabecera" % (path, numero, linea[:40])
+            )
+            break
+    return problemas
+
+
 def _run_batch(argv: list[str], timeout_s: float) -> dict[str, Any]:
     """Batch mode: VOSviewer exits by itself; we only guard it against modal dialogs."""
     started = time.monotonic()
     for i, token in enumerate(argv):
         if token.startswith("-") and "save" in token and i + 1 < len(argv):
             target = argv[i + 1]
-            if target and not target.startswith("-") and os.path.isfile(target):
-                try:
-                    os.unlink(target)
-                except OSError:
-                    pass
+            if target and not target.startswith("-"):
+                # La carpeta tiene que existir y quedar con integridad baja:
+                # si no, VOSviewer abre un dialogo "Acceso denegado" y cuelga.
+                _prepare_out_dir(target)
+                if os.path.isfile(target):
+                    try:
+                        os.unlink(target)
+                    except OSError:
+                        pass
     argv = [VOSVIEWER_EXE] + argv  # build_argv emits flags only, never the program
+    # La salida va a archivos y no a pipes: un pipe sin lector traba al hijo
+    # cuando escribe mas de 64 KB y el poll lo ve vivo hasta el timeout.
+    registros = tempfile.TemporaryFile(mode="w+b")
+    errores = tempfile.TemporaryFile(mode="w+b")
     proc = subprocess.Popen(
         argv,
         cwd=os.path.dirname(VOSVIEWER_EXE),
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=registros,
+        stderr=errores,
+        env=_vosviewer_env(),
     )
     deadline, dialog, kids = started + timeout_s, None, set()
     answered: list[dict[str, Any]] = []
@@ -979,11 +1329,21 @@ def _run_batch(argv: list[str], timeout_s: float) -> dict[str, Any]:
             }
         time.sleep(0.2)
     try:
-        out, err = proc.communicate(timeout=15)
+        proc.wait(timeout=15)
     except subprocess.TimeoutExpired:
         _kill_tree(proc.pid)
-        out, err = b"", b""
-    # the launcher may exit while its javaw.exe child is still writing outputs
+    out = registros.read()
+    err = errores.read()
+    registros.close()
+    errores.close()
+    # The launcher may exit while its javaw.exe child is still writing outputs.
+    # Killing that child in the middle leaves half-written files and an orphan
+    # that the next run finds alive, so it gets a grace period first.
+    limite = time.monotonic() + 6
+    while time.monotonic() < limite:
+        if not [p for p in kids if _pid_alive(p)]:
+            break
+        time.sleep(0.2)
     killed = [p for p in sorted(kids) if _pid_alive(p)]
     for pid in killed:
         _kill_tree(pid)
@@ -1003,7 +1363,9 @@ def _run_batch(argv: list[str], timeout_s: float) -> dict[str, Any]:
             "elapsed_s": round(time.monotonic() - started, 2),
         }
     return {
-        "ok": True,
+        # El exito se decide por el codigo de salida: sin esto, una corrida que
+        # VOSviewer aborta con excepcion se reportaba como exitosa.
+        "ok": proc.returncode == 0,
         "exit_code": proc.returncode,
         "elapsed_s": round(time.monotonic() - started, 2),
         "stdout": (out or b"").decode("utf-8", "replace")[-2000:],
@@ -1021,6 +1383,8 @@ def _collect_outputs(outputs: dict[str, Any]) -> dict[str, Any]:
         entry: dict[str, Any] = {"path": full, "bytes": 0}
         if os.path.exists(full):
             entry["bytes"] = os.path.getsize(full)
+            if entry["bytes"] == 0:
+                entry["empty"] = True
         else:
             entry["missing"] = True
         report[flag] = entry
@@ -1028,7 +1392,11 @@ def _collect_outputs(outputs: dict[str, Any]) -> dict[str, Any]:
 
 
 def _stats_from(outputs: dict[str, Any]) -> dict[str, Any]:
-    ready = {k: v["path"] for k, v in outputs.items() if not v.get("missing")}
+    ready = {
+        k: v["path"]
+        for k, v in outputs.items()
+        if not v.get("missing") and not v.get("empty")
+    }
     if "save_json" in ready:
         doc = parse_json_map(ready["save_json"])
     elif "save_map" in ready:
@@ -1098,44 +1466,100 @@ def vos_analyze(
     camera: dict[str, Any] | None = None,
     interaction: dict[str, Any] | None = None,
     misc: dict[str, Any] | None = None,
+    corpus: dict[str, Any] | None = None,
     timeout_s: float = 180,
 ) -> dict[str, Any]:
-    """Run a batch job. Always returns with the process gone."""
+    """Corre una tanda en modo batch y devuelve lo que se escribio de verdad.
+
+    Los archivos de captura no van en el argv del batch: el flag
+    -save_screenshot_png aborta la corrida en esta maquina. Se sacan despues,
+    de la ventana viva, que es la unica via que entrega un PNG con contenido.
+    """
     try:
         if source not in _INPUT_FLAGS:
             raise ValueError(f"unknown source '{source}'; allowed: {_INPUT_FLAGS}")
         if not os.path.exists(VOSVIEWER_EXE):
             raise FileNotFoundError(f"VOSviewer not found at {VOSVIEWER_EXE}")
-        inputs = {source: _absolute(source_path)}
-        for flag, path in (
-            ("network", network_path),
-            ("thesaurus", thesaurus_path),
-            ("scores", scores_path),
-        ):
-            if path:
-                inputs[flag] = _absolute(path)
+        problema_java = _java_problem()
+        if problema_java:
+            raise RuntimeError(problema_java)
+        vivos = _alive_pids()
+        if vivos:
+            raise RuntimeError(
+                "ya hay una instancia de VOSviewer corriendo (pids %s). Una corrida "
+                "batch con la aplicacion abierta se queda esperando un dialogo que "
+                "nunca aparece: cerrala con vos_close y volve a correr"
+                % ", ".join(map(str, vivos))
+            )
+        entradas = _build_inputs(
+            source, source_path, network_path, thesaurus_path, scores_path
+        )
+        problemas = _validate_inputs(entradas)
+        if problemas:
+            return {
+                "ok": False,
+                "error": "entrada invalida: " + "; ".join(problemas),
+                "hint": "corrige el archivo antes de correr: VOSviewer responderia con "
+                "un dialogo modal que hay que cerrar a mano",
+                "problems": problemas,
+            }
+        pedidos = dict(outputs or {})
+        capturas = {k: v for k, v in pedidos.items() if k.startswith("save_screenshot")}
+        salidas = {k: v for k, v in pedidos.items() if not k.startswith("save_screenshot")}
+        if not salidas and not capturas:
+            raise ValueError(
+                "hay que pedir al menos una salida: save_map, save_network, "
+                "save_json o save_screenshot_*"
+            )
+        if not salidas:
+            return _solo_capturas(entradas, capturas, layout, visualization)
         argv = build_argv(
             {
-                "input": inputs,
-                "save": dict(outputs or {}),
+                "input": entradas,
+                "save": dict(salidas),
                 "layout": layout or {},
                 "visualization": visualization or {},
                 "camera": camera or {},
                 "interaction": interaction or {},
                 "misc": misc or {},
+                "corpus": corpus or {},
             },
             require_saves=True,
         )
         result = _run_batch(argv, timeout_s)
+        written = _collect_outputs(salidas)
+        faltan = sorted(k for k, e in written.items() if e.get("missing"))
         if not result.get("ok"):
-            return result
-        written = _collect_outputs(outputs)
-        STATE.setdefault("last_outputs", {})["analyze"] = {
-            "when": time.time(),
-            "argv": argv,
-            "outputs": written,
-        }
-        return {
+            respuesta = dict(result)
+            respuesta["outputs"] = written
+            respuesta["missing_outputs"] = faltan
+            stderr = (result.get("stderr") or "").strip()
+            if stderr:
+                primera = stderr.splitlines()[0][:200]
+                respuesta["hint"] = (
+                    "VOSviewer salio con codigo %s y no escribio %s. Primera linea "
+                    "del stderr: %s"
+                    % (result.get("exit_code"), ", ".join(faltan) or "nada", primera)
+                )
+            return respuesta
+        recuperaciones: list[dict[str, Any]] = []
+        mapa_calculado = written.get("save_map", {}).get("path") or entradas.get("map")
+        for flag in sorted(capturas):
+            r = _recover_screenshot(
+                mapa_calculado,
+                entradas.get("network"),
+                layout,
+                visualization,
+                capturas[flag],
+            )
+            recuperaciones.append({"flag": flag, **r})
+            written[flag] = {
+                "path": _absolute(capturas[flag]),
+                "bytes": r.get("bytes", 0),
+                "recovered": bool(r.get("ok")),
+            }
+        vacios = sorted(k for k, e in written.items() if e.get("empty"))
+        respuesta = {
             "ok": True,
             "exit_code": result["exit_code"],
             "elapsed_s": result["elapsed_s"],
@@ -1145,11 +1569,59 @@ def vos_analyze(
             "stdout": result["stdout"],
             "stderr": result["stderr"],
         }
+        if recuperaciones:
+            respuesta["screenshot_recovery"] = recuperaciones
+        avisos: list[str] = []
+        if vacios:
+            avisos.append("Quedaron archivos de 0 bytes: %s" % ", ".join(vacios))
+        sin_captura = [r["flag"] for r in recuperaciones if not r.get("ok")]
+        if sin_captura:
+            avisos.append("No se pudieron sacar las capturas: %s" % ", ".join(sin_captura))
+        if avisos:
+            respuesta["warnings"] = avisos
+        STATE.setdefault("last_outputs", {})["analyze"] = {
+            "when": time.time(),
+            "argv": argv,
+            "outputs": written,
+        }
+        return respuesta
     except Exception as exc:
         return _fail(
             exc, "only whitelisted flags are accepted; run vos_status for context"
         )
 
+
+def _solo_capturas(
+    entradas: dict[str, str],
+    capturas: dict[str, str],
+    layout: dict[str, Any] | None,
+    visualization: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Caso de una corrida que solo pide capturas: no hay tanda que correr."""
+    written: dict[str, Any] = {}
+    recuperaciones: list[dict[str, Any]] = []
+    for flag in sorted(capturas):
+        r = _recover_screenshot(
+            entradas.get("map"),
+            entradas.get("network"),
+            layout,
+            visualization,
+            capturas[flag],
+        )
+        recuperaciones.append({"flag": flag, **r})
+        written[flag] = {
+            "path": _absolute(capturas[flag]),
+            "bytes": r.get("bytes", 0),
+            "recovered": bool(r.get("ok")),
+        }
+    return {
+        "ok": bool(recuperaciones) and all(r.get("ok") for r in recuperaciones),
+        "elapsed_s": 0.0,
+        "argv": [],
+        "outputs": written,
+        "stats": {},
+        "screenshot_recovery": recuperaciones,
+    }
 
 @mcp.tool(
     description=(
@@ -1208,7 +1680,7 @@ def vos_read(
             it
         ) in ordered:  # every cluster gets a summary, not only the ones in the page
             rows = buckets.setdefault(str(it["cluster"]), [])
-            if len(rows) < min(int(top_n), 5):
+            if len(rows) < min(max(1, int(top_n)), 5):
                 rows.append(it)
         clusters = [
             {
@@ -1252,7 +1724,6 @@ def vos_read(
 
 def _grab(hwnd: int, rect: list[int]) -> tuple[Any, str]:
     """PrintWindow first; Java Swing sometimes renders black, so verify and BitBlt."""
-    from PIL import Image
 
     left, top, width, height = rect
     hdc_win = user32.GetWindowDC(hwnd)
@@ -1325,7 +1796,7 @@ def vos_capture(
                 if out_path
                 else os.path.join(DEFAULT_OUT_DIR, f"capture_{int(time.time())}.png")
             )
-            os.makedirs(os.path.dirname(path), exist_ok=True)
+            _prepare_out_dir(path)
             img.save(path)
             STATE.setdefault("last_outputs", {})["capture"] = {
                 "when": time.time(),
@@ -1352,23 +1823,18 @@ def vos_capture(
         }
         saves.update(outputs or {})
         result = vos_analyze(
-            source,
-            source_path or "",
-            saves,
-            network_path,
-            None,
-            None,
-            layout,
-            visualization,
-            None,
-            None,
-            None,
-            timeout_s,
+            source=source,
+            source_path=source_path or "",
+            outputs=saves,
+            network_path=network_path,
+            layout=layout,
+            visualization=visualization,
+            timeout_s=timeout_s,
         )
         if not result.get("ok"):
             return result
         primary = result["outputs"].get("save_screenshot_png", {})
-        return {
+        respuesta = {
             "ok": True,
             "path": primary.get("path"),
             "bytes": primary.get("bytes", 0),
@@ -1377,6 +1843,11 @@ def vos_capture(
             "elapsed_s": result["elapsed_s"],
             "outputs": result["outputs"],
         }
+        if result.get("warnings"):
+            respuesta["warnings"] = result["warnings"]
+        if result.get("screenshot_recovery"):
+            respuesta["screenshot_recovery"] = result["screenshot_recovery"]
+        return respuesta
     except Exception as exc:
         return _fail(
             exc, "scope='window' needs a live process; scope='map' needs valid inputs"
@@ -1409,6 +1880,9 @@ def vos_open(
     try:
         if not os.path.exists(VOSVIEWER_EXE):
             raise FileNotFoundError(f"VOSviewer not found at {VOSVIEWER_EXE}")
+        problema_java = _java_problem()
+        if problema_java:
+            raise RuntimeError(problema_java)
         if STATE.get("proc") and STATE["proc"].poll() is None:
             raise RuntimeError(f"VOSviewer already running (pid {STATE['pid']})")
         groups = {
@@ -1446,6 +1920,7 @@ def vos_open(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=_vosviewer_env(),
         )
         started_pid = proc.pid
         STATE.update(
@@ -1459,13 +1934,17 @@ def vos_open(
             }
         )
         deadline, frame, windows, dialog = time.time() + 30, None, [], None
+        # Solo el arbol de este proceso: barrer la maquina entera podia devolver
+        # la ventana de otra instancia ya abierta.
+        mios: set[int] = {proc.pid}
         while time.time() < deadline:
             if proc.poll() is not None:
                 raise RuntimeError(
                     f"VOSviewer exited immediately (code {proc.returncode}); interactive "
                     "mode must not pass any save_* argument"
                 )
-            pids = _vosviewer_pids()
+            mios.update(_process_children(proc.pid))
+            pids = sorted(mios)
             dialog = _error_dialog_text(pids)
             if dialog:
                 raise RuntimeError(f"VOSviewer raised a modal dialog: {dialog}")
@@ -1623,16 +2102,15 @@ def vos_status() -> dict[str, Any]:
 
 
 def _send(inputs: list[INPUT]) -> int:
+    """Envia input. Devuelve cuantos eventos se aceptaron (0 = bloqueado)."""
     arr = (INPUT * len(inputs))(*inputs)
-    return user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
-
-
-def _abs_flags(sx: int, sy: int) -> int:
-    left, top = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)
-    width = max(1, user32.GetSystemMetrics(78) - 1)
-    height = max(1, user32.GetSystemMetrics(79) - 1)
-    user32.SetCursorPos(sx, sy)  # keeps the virtual-desktop offset honest
-    return MOUSEEVENTF["move"] | MOUSEEVENTF["absolute"]
+    enviados = user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
+    if enviados != len(inputs):
+        raise RuntimeError(
+            "SendInput acepto %d de %d eventos: otra aplicacion tiene el foco o "
+            "el proceso corre con menor integridad" % (enviados, len(inputs))
+        )
+    return enviados
 
 
 def _mouse(sx: int, sy: int, flag: str, data: int = 0) -> INPUT:
@@ -1740,14 +2218,11 @@ def vos_ui(
             sx = left + (x if x is not None else width // 2)
             sy = top + (y if y is not None else height // 2)
             if action == "wheel":
-                _send([_mouse(0, 0, "move"), _mouse(0, 0, "wheel", delta & 0xFFFFFFFF)])
+                # La rueda se despacha donde esta el puntero: primero se mueve.
                 user32.SetCursorPos(sx, sy)
+                time.sleep(0.05)
+                _send([_mouse(0, 0, "wheel", delta & 0xFFFFFFFF)])
             else:
-                down, up = MOUSEEVENTF["ldown"], MOUSEEVENTF["lup"]
-                if action == "right_click":
-                    down, up = MOUSEEVENTF["rdown"], MOUSEEVENTF["rup"]
-                elif action == "middle_click":
-                    down, up = MOUSEEVENTF["mdown"], MOUSEEVENTF["mup"]
                 if action == "drag":
                     reach = delta or 100
                     tx = left + (
@@ -1760,15 +2235,17 @@ def vos_ui(
                         if to_y is not None
                         else max(0, min(height - 4, (y or 0) + reach))
                     )
-                    seq = [_mouse(0, 0, "move"), _mouse(0, 0, "ldown")]
+                    # El movimiento se hace con SetCursorPos: un MOUSEEVENTF_MOVE
+                    # sin ABSOLUTE es un delta, y mandar coordenadas absolutas
+                    # como delta lanzaba el puntero fuera de la pantalla.
+                    user32.SetCursorPos(sx, sy)
+                    _send([_mouse(0, 0, "ldown")])
                     for i in range(1, 9):
-                        seq.append(
-                            _mouse(
-                                sx + (tx - sx) * i // 8, sy + (ty - sy) * i // 8, "move"
-                            )
+                        user32.SetCursorPos(
+                            sx + (tx - sx) * i // 8, sy + (ty - sy) * i // 8
                         )
-                    _send(seq + [_mouse(0, 0, "lup")])
-                    user32.SetCursorPos(tx, ty)
+                        time.sleep(0.02)
+                    _send([_mouse(0, 0, "lup")])
                 else:
                     press = {
                         "click": ("ldown", "lup"),
@@ -2144,7 +2621,7 @@ def vos_from_scopus(
             if not result.get("ok"):
                 break
 
-        stats = _stats_from(runs[-1]["outputs"]) if runs else {}
+        stats = _stats_from(runs[0]["outputs"])
         failed = [r for r in runs if not r["ok"] or r["missing"]]
         generated_at = (
             datetime.datetime.now().astimezone().isoformat(timespec="seconds")
@@ -2362,7 +2839,7 @@ def vos_dialog(action: str = "list", hwnd: int | None = None) -> dict[str, Any]:
             raise ValueError(
                 f"action must be list|capture|yes|no|cancel, got {action!r}"
             )
-        pids = _live_vos_pids()
+        pids = _vosviewer_only_pids()
         if not pids:
             return {
                 "ok": False,
