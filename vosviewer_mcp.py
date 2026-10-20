@@ -1204,18 +1204,26 @@ def _recover_screenshot(
                 pass
 
 
-def _imagen_con_contenido(path: str) -> bool:
-    """True si el PNG no es una imagen lisa.
+def _imagen_tiene_contenido(imagen: Any) -> bool:
+    """True si el render no es una imagen lisa.
 
     Una ventana sin pintar produce dos capturas identicas: sin esta comprobacion
     la recuperacion devolveria un PNG blanco como si fuera el mapa.
     """
     try:
+        extremos = imagen.convert("L").getextrema()
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("no se pudo leer la imagen capturada: %s" % exc) from exc
+    return bool(extremos) and extremos[0] != extremos[1]
+
+
+def _imagen_con_contenido(path: str) -> bool:
+    """Lo mismo, sobre un archivo."""
+    try:
         with Image.open(path) as imagen:
-            extremos = imagen.convert("L").getextrema()
+            return _imagen_tiene_contenido(imagen)
     except (OSError, ValueError) as exc:
         raise RuntimeError("no se pudo leer la captura %s: %s" % (path, exc)) from exc
-    return bool(extremos) and extremos[0] != extremos[1]
 
 
 def _validate_map_file(path: str) -> list[str]:
@@ -1824,6 +1832,18 @@ def vos_capture(
                 time.sleep(0.4)
                 _, info = _main_window(alive, target)
             img, method = _grab(hwnd, info["rect"])
+            intentos = 1
+            # La ventana puede no estar pintada todavia. Una imagen lisa no es
+            # una captura valida: se espera y se reintenta.
+            while img is not None and not _imagen_tiene_contenido(img) and intentos < 4:
+                time.sleep(1.0)
+                img, method = _grab(hwnd, info["rect"])
+                intentos += 1
+            if img is None:
+                raise RuntimeError(
+                    "no se pudo capturar la ventana %s (metodo %s): VOSviewer esta "
+                    "viva pero no se pudo leer su lienzo" % (info.get("title"), method)
+                )
             path = (
                 _absolute(out_path)
                 if out_path
@@ -1844,6 +1864,8 @@ def vos_capture(
                 "height": img.height,
                 "scope": scope,
                 "method": method,
+                "attempts": intentos,
+                "painted": _imagen_tiene_contenido(img),
                 "pids": alive,
                 "pid": alive[0],
                 "gui_pid": info.get("pid"),

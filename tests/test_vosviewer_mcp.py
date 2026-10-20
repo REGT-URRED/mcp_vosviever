@@ -217,3 +217,23 @@ def test_analyze_falla_rapido_si_ya_hay_una_instancia_viva(tmp_path, monkeypatch
 
     assert not resultado["ok"]
     assert "instancia" in str(resultado.get("error", "")).lower()
+
+
+@pytest.mark.skipif(not VOSVIEWER_DISPONIBLE, reason="VOSviewer.exe no esta instalado")
+def test_la_captura_de_la_ventana_viene_pintada(tmp_path):
+    """Una ventana sin pintar daria una imagen lisa, no una captura."""
+    mapa = _escribir_mapa(tmp_path / "mapa.txt")
+    destino = tmp_path / "salida" / "ventana.png"
+
+    abierto = v.vos_open(source="map", source_path=mapa)
+    assert abierto["ok"], abierto
+    try:
+        captura = v.vos_capture(
+            scope="window", target=str(abierto["hwnd"]), out_path=str(destino)
+        )
+    finally:
+        v.vos_close()
+
+    assert captura["ok"], captura
+    assert captura["painted"] is True
+    assert destino.stat().st_size > 0

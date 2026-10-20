@@ -86,6 +86,9 @@ captures (`01_red.png`, `02_overlay.png`, `03_densidad.png`).
 
 - **Batch vs interactive.** VOSviewer exits by itself when argv contains at least one
   `save_*` flag; without one it stays open. The server never blends the two paths.
+- **A capture waits for the paint.** `vos_capture(scope="window")` rejects a flat
+  image: if the window has not painted yet it waits and retries, and reports
+  `painted` and `attempts` so the caller knows what it got.
 - **Captures do not travel in the batch argv.** `-save_screenshot_png` aborts the batch
   run on this machine and leaves an empty file. The server therefore runs the batch
   without the screenshot flags and takes the picture from the live window afterwards
